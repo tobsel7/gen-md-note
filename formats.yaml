@@ -1,4 +1,5 @@
-concert: "- {Artist} ({Venue}, {Notes})"
-music: "- {Artist} - {Album/Track}"
-book: "- {Title} {Author}"
+music-event-attendance: "- {YYYY-MM-DD}: {Artist}[ ({Event Name} at {Venue})]"
+movie: "- {Title}: {Note}"
+song: "- {Artist}[ - {Album/Track}]"
+book: "- {Title}[ {Author}][: {Note}]"
 journal: "- {YYYY-MM-DD}: {Note}"

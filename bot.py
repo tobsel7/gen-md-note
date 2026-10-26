@@ -3,19 +3,20 @@ import json
 import os
 import re
 import string
+from datetime import date
 from pathlib import Path
 
-import google.generativeai as genai
-from google.api_core import exceptions as google_api_exceptions
+from google import genai
+from google.genai import errors, types
 import yaml
-from google.generativeai import GenerationConfig
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 
 FORMATS_PATH = Path(__file__).with_name("formats.yaml")
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+OPTIONAL_SECTION_PATTERN = re.compile(r"\[([^\[\]]*)\]")
 
 
 def load_formats() -> tuple[dict[str, str], str]:
@@ -31,43 +32,77 @@ def load_formats() -> tuple[dict[str, str], str]:
         raise RuntimeError("Format categories must be non-empty strings")
     if any(not isinstance(template, str) or not template for template in formats.values()):
         raise RuntimeError("Format values must be non-empty strings")
+    for template in formats.values():
+        if template.count("[") != template.count("]"):
+            raise RuntimeError("Optional format sections must be balanced and grouped")
+        if any(not template_fields(match.group(1)) for match in OPTIONAL_SECTION_PATTERN.finditer(template)):
+            raise RuntimeError("Optional format sections must contain placeholders")
     return formats, formats_text
 
 
-def line_matches_format(line: str, template: str) -> bool:
-    pattern = []
-    formatter = string.Formatter()
-    try:
-        fields = list(formatter.parse(template))
-    except ValueError:
-        return False
-
-    for literal, field_name, format_spec, conversion in fields:
-        if literal:
-            pattern.append(re.escape(literal))
-        if field_name is None:
-            continue
-        if format_spec or conversion or not field_name.isidentifier():
-            return False
-        pattern.append(r".+?")
-    return bool(re.fullmatch("".join(pattern), line))
+def template_fields(template: str) -> set[str]:
+    fields = set()
+    for _, field_name, _, _ in string.Formatter().parse(template):
+        if field_name is not None:
+            fields.add(field_name)
+    return fields
 
 
-def validate_result(result: object, formats: dict[str, str]) -> tuple[str, str]:
+def render_template(template: str, values: dict[str, str]) -> str:
+    rendered = []
+    position = 0
+    for match in OPTIONAL_SECTION_PATTERN.finditer(template):
+        rendered.append(template[position:match.start()])
+        section = match.group(1)
+        section_fields = template_fields(section)
+        if section_fields and all(values.get(field, "").strip() for field in section_fields):
+            rendered.append(section)
+        position = match.end()
+    rendered.append(template[position:])
+    return "".join(rendered).format_map(values)
+
+
+def format_result(result: object, formats: dict[str, str]) -> tuple[str, str]:
     if not isinstance(result, dict):
         raise ValueError("Gemini returned a JSON value instead of an object")
     category = result.get("category")
-    formatted_line = result.get("formatted_line")
+    fields = result.get("fields")
     if not isinstance(category, str) or category not in formats:
         raise ValueError("Gemini returned an unknown category")
     if not CATEGORY_PATTERN.fullmatch(category):
         raise ValueError("Gemini returned an unsafe category")
-    if not isinstance(formatted_line, str) or not formatted_line.strip():
-        raise ValueError("Gemini returned an empty formatted line")
-    if formatted_line != formatted_line.strip() or "\n" in formatted_line or "\r" in formatted_line:
-        raise ValueError("Gemini returned a multiline or padded formatted line")
-    if not line_matches_format(formatted_line, formats[category]):
-        raise ValueError("Gemini returned a line that does not match the category format")
+    if not isinstance(fields, list):
+        raise ValueError("Gemini did not return note fields")
+
+    template = formats[category]
+    placeholders = template_fields(OPTIONAL_SECTION_PATTERN.sub("", template))
+    values = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            raise ValueError("Gemini returned an invalid note field")
+        name = field.get("name")
+        value = field.get("value")
+        if not isinstance(name, str) or name in values:
+            raise ValueError("Gemini returned duplicate or invalid field names")
+        if not isinstance(value, str):
+            raise ValueError(f"Gemini returned an invalid value for {name}")
+        values[name] = value.strip()
+
+    for placeholder in template_fields(template):
+        value = values.get(placeholder)
+        if placeholder in placeholders and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"Gemini did not provide {placeholder}")
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"Gemini returned multiline text for {placeholder}")
+        values[placeholder] = value
+
+    try:
+        formatted_line = render_template(template, values)
+    except (KeyError, ValueError) as exc:
+        raise ValueError("The configured category format is invalid") from exc
     return category, formatted_line
 
 
@@ -77,21 +112,35 @@ def append_line(vault_path: Path, category: str, formatted_line: str) -> None:
         markdown_file.write(formatted_line + "\n")
 
 
-def create_model() -> genai.GenerativeModel:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    return genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config=GenerationConfig(
+def create_client() -> genai.Client:
+    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def generate_content(client: genai.Client, prompt: str):
+    return client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema={
                 "type": "object",
                 "properties": {
                     "category": {"type": "string"},
-                    "formatted_line": {"type": "string"},
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "value": {"type": "string"},
+                            },
+                            "required": ["name", "value"],
+                        },
+                    },
                 },
-                "required": ["category", "formatted_line"],
+                "required": ["category", "fields"],
             },
-        )
+        ),
     )
 
 
@@ -109,27 +158,29 @@ async def handle_text(
 
     formats = context.application.bot_data["formats"]
     formats_text = context.application.bot_data["formats_text"]
-    model = context.application.bot_data["model"]
+    client = context.application.bot_data["client"]
     vault_path = context.application.bot_data["vault_path"]
     prompt = (
-        "Classify and format the following note. Return only the requested JSON object.\n"
-        'The object must have exactly "category" and "formatted_line" keys.\n'
-        "Choose category from the formats below and follow its format exactly. "
-        "The formatted line must be one line.\n\n"
+        "Classify the note and extract values for the selected category. "
+        "Return only the requested JSON object. The object must have exactly "
+        '"category" and "fields" keys. "fields" must be an array of objects '
+        'with "name" and "value" keys, containing the placeholder values needed '
+        "by that category. Use today's date for YYYY-MM-DD.\n\n"
         f"formats.yaml:\n{formats_text}\n\n"
+        f"Today's date: {date.today().isoformat()}\n\n"
         f"Note:\n{message.text}"
     )
 
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await asyncio.to_thread(generate_content, client, prompt)
         result = json.loads(response.text)
-        category, formatted_line = validate_result(result, formats)
+        category, formatted_line = format_result(result, formats)
         await asyncio.to_thread(append_line, vault_path, category, formatted_line)
     except (json.JSONDecodeError, ValueError, OSError, RuntimeError) as exc:
         await message.reply_text(f"Could not save your note: {exc}")
         return
-    except google_api_exceptions.GoogleAPIError:
-        await message.reply_text("Could not save your note because the formatting service failed.")
+    except errors.APIError as exc:
+        await message.reply_text(f"Could not save your note because the formatting service failed: {exc}")
         return
 
     await message.reply_text(f"Saved to {category}.md")
@@ -140,9 +191,9 @@ async def post_init(application: Application) -> None:
         formats, formats_text = load_formats()
         application.bot_data["formats"] = formats
         application.bot_data["formats_text"] = formats_text
-        application.bot_data["model"] = create_model()
+        application.bot_data["client"] = create_client()
         application.bot_data["allowed_user_id"] = int(os.environ["ALLOWED_USER_ID"])
-        application.bot_data["vault_path"] = Path(os.environ.get("VAULT_PATH")).expanduser()
+        application.bot_data["vault_path"] = Path(os.environ.get("VAULT_PATH", "vault")).expanduser()
     except (KeyError, ValueError, RuntimeError) as exc:
         raise RuntimeError(f"Invalid bot configuration: {exc}") from exc
 
